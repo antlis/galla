@@ -2,6 +2,7 @@
 
 **A minimal, keyboard-driven image & video thumbnail gallery for the desktop.**
 
+[![crates.io](https://img.shields.io/crates/v/galla)](https://crates.io/crates/galla)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Linux%20(X11%20%7C%20Wayland)-lightgrey)
@@ -30,7 +31,13 @@ or as an `xdg` image handler.
 
 ## Install
 
-Build from source with Cargo:
+From crates.io:
+
+```sh
+cargo install galla
+```
+
+Or build from source:
 
 ```sh
 git clone https://github.com/antlis/galla
