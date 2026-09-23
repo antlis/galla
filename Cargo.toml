@@ -2,9 +2,14 @@
 name = "galla"
 version = "0.2.0"
 edition = "2021"
-description = "Minimal image/video thumbnail gallery with zoom and a configurable external video player"
+description = "Minimal, keyboard-driven image & video thumbnail gallery with a built-in zoom/pan viewer and a configurable external video player"
 license = "MIT"
 repository = "https://github.com/antlis/galla"
+homepage = "https://github.com/antlis/galla"
+readme = "README.md"
+keywords = ["gallery", "image-viewer", "thumbnails", "viewer", "mpv"]
+categories = ["command-line-utilities", "multimedia::images"]
+exclude = ["/.github", "/demo.gif"]
 
 [dependencies]
 eframe = "0.29"
