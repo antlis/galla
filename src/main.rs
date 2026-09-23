@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -221,17 +222,25 @@ fn config_value(key: &str) -> Option<String> {
 }
 
 fn spawn_player(player: &[String], path: &Path) {
-    if let Some((cmd, args)) = player.split_first() {
-        let _ = Command::new(cmd).args(args).arg(path).spawn();
+    spawn_with(player, std::slice::from_ref(&path.to_path_buf()));
+}
+
+/// Spawn `cmd` with one or more file paths appended. Handing several video paths
+/// to mpv opens them as a playlist; handing several files to dragon-drop shows
+/// one draggable tile per file.
+fn spawn_with(cmd: &[String], paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    if let Some((c, args)) = cmd.split_first() {
+        let _ = Command::new(c).args(args).args(paths).spawn();
     }
 }
 
 /// Hand the file to an external drag-and-drop source (default `dragon-drop`) so
 /// it can be dragged into other apps (Telegram, browsers, file managers…).
 fn spawn_drag(drag: &[String], path: &Path) {
-    if let Some((cmd, args)) = drag.split_first() {
-        let _ = Command::new(cmd).args(args).arg(path).spawn();
-    }
+    spawn_with(drag, std::slice::from_ref(&path.to_path_buf()));
 }
 
 fn copy_path(path: &Path) {
@@ -258,15 +267,18 @@ fn copy_image(path: &Path) {
 const HELP_KEYS: &[(&str, &str)] = &[
     ("←/→   h / l", "move selection · prev/next image"),
     ("↑/↓   k / j", "move selection (grid)"),
-    ("Enter", "open image in viewer · play video"),
+    ("Space", "mark / unmark the current tile"),
+    ("Shift+click", "mark a range of tiles"),
+    ("Enter", "open image · play video(s) (marked or hovered)"),
     ("y", "copy file path to clipboard"),
     ("Y", "copy image to clipboard"),
-    ("d", "drag-and-drop file into another app"),
+    ("d", "drag-and-drop file(s) into another app"),
+    ("D", "move file(s) to trash — asks to confirm"),
     ("+ / - / scroll", "zoom (single view)"),
     ("mouse drag", "pan (single view)"),
     ("0", "reset zoom (single view)"),
     ("?", "toggle this help"),
-    ("q / Esc", "back · quit"),
+    ("q / Esc", "clear selection · back · quit"),
 ];
 
 enum Mode {
@@ -285,12 +297,14 @@ struct GallaApp {
     player: Vec<String>,
     drag: Vec<String>,
     selected: usize,
+    marked: HashSet<usize>,
     cols: usize,
     scroll_to_selected: bool,
     show_help: bool,
+    confirm_delete: Option<Vec<usize>>,
     toast: Option<(String, Instant)>,
     mode: Mode,
-    rx: Receiver<(usize, ColorImage)>,
+    rx: Receiver<(PathBuf, ColorImage)>,
 }
 
 impl GallaApp {
@@ -310,16 +324,17 @@ impl GallaApp {
         // Generate thumbnails on a background thread so the UI stays responsive.
         let (tx, rx) = channel();
         let ctx = cc.egui_ctx.clone();
-        let jobs: Vec<(usize, PathBuf, Kind)> = entries
+        // Keyed by path (not index) so a later deletion can't misassign a
+        // thumbnail that is still being generated.
+        let jobs: Vec<(PathBuf, Kind)> = entries
             .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.path.clone(), e.kind))
+            .map(|e| (e.path.clone(), e.kind))
             .collect();
         std::thread::spawn(move || {
             let cache = cache_dir();
-            for (i, path, kind) in jobs {
+            for (path, kind) in jobs {
                 let ci = make_thumb(&path, kind, &cache).unwrap_or_else(|| placeholder(kind));
-                if tx.send((i, ci)).is_err() {
+                if tx.send((path, ci)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -344,9 +359,11 @@ impl GallaApp {
             player,
             drag,
             selected: 0,
+            marked: HashSet::new(),
             cols: 1,
             scroll_to_selected: false,
             show_help: false,
+            confirm_delete: None,
             toast: None,
             mode,
             rx,
@@ -393,14 +410,137 @@ impl GallaApp {
             offset: Vec2::ZERO,
         };
     }
+
+    /// The entries an action applies to: the marked set if any, else the cursor.
+    fn targets(&self) -> Vec<usize> {
+        if self.marked.is_empty() {
+            if self.entries.is_empty() {
+                vec![]
+            } else {
+                vec![self.selected]
+            }
+        } else {
+            let mut v: Vec<usize> = self
+                .marked
+                .iter()
+                .copied()
+                .filter(|&i| i < self.entries.len())
+                .collect();
+            v.sort_unstable();
+            v
+        }
+    }
+
+    fn rebuild_image_indices(&mut self) {
+        self.image_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == Kind::Image)
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// Move the files at `idxs` to the trash and drop them from the gallery.
+    fn perform_delete(&mut self, mut idxs: Vec<usize>) {
+        idxs.retain(|&i| i < self.entries.len());
+        idxs.sort_unstable();
+        idxs.dedup();
+        if idxs.is_empty() {
+            return;
+        }
+
+        let was_single = matches!(self.mode, Mode::Single { .. });
+        // Only drop entries that actually made it to the trash; keep the rest.
+        let mut removed: Vec<usize> = Vec::new();
+        let mut fail = 0u32;
+        for &i in &idxs {
+            if trash::delete(&self.entries[i].path).is_ok() {
+                removed.push(i);
+            } else {
+                fail += 1;
+            }
+        }
+        let ok = removed.len() as u32;
+        // Drop removed entries (descending so earlier indices stay valid).
+        for &i in removed.iter().rev() {
+            self.entries.remove(i);
+        }
+        self.rebuild_image_indices();
+        self.marked.clear();
+        self.selected = self
+            .selected
+            .saturating_sub(removed.iter().filter(|&&i| i < self.selected).count())
+            .min(self.entries.len().saturating_sub(1));
+
+        // A single-view delete drops back to the grid near the deleted spot.
+        if was_single {
+            self.mode = Mode::Grid;
+        }
+        if self.entries.is_empty() {
+            self.notify("Trashed last file — empty");
+        } else if fail == 0 {
+            self.notify(format!("Trashed {ok} file(s)"));
+        } else {
+            self.notify(format!("Trashed {ok}, failed {fail}"));
+        }
+    }
+
+    fn draw_confirm(&self, ctx: &egui::Context) {
+        let Some(targets) = &self.confirm_delete else {
+            return;
+        };
+        let n = targets.len();
+        let names: Vec<String> = targets
+            .iter()
+            .filter_map(|&i| self.entries.get(i))
+            .take(6)
+            .map(|e| {
+                e.path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        egui::Area::new(egui::Id::new("galla_confirm"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_gray(20))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(200, 90, 90)))
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("Move {n} file(s) to trash?"))
+                                .heading()
+                                .color(Color32::from_rgb(230, 120, 120)),
+                        );
+                        ui.add_space(8.0);
+                        for name in &names {
+                            ui.label(RichText::new(name).monospace());
+                        }
+                        if n > names.len() {
+                            ui.label(RichText::new(format!("… and {} more", n - names.len())).monospace());
+                        }
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("y / Enter = trash    n / Esc = cancel")
+                                .monospace()
+                                .color(Color32::from_gray(160)),
+                        );
+                    });
+            });
+    }
 }
 
 impl eframe::App for GallaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain freshly generated thumbnails and upload them as textures.
-        while let Ok((i, ci)) = self.rx.try_recv() {
-            if let Some(e) = self.entries.get_mut(i) {
-                e.tex = Some(ctx.load_texture(format!("thumb{i}"), ci, TextureOptions::LINEAR));
+        while let Ok((path, ci)) = self.rx.try_recv() {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
+                let name = path.to_string_lossy().into_owned();
+                e.tex = Some(ctx.load_texture(name, ci, TextureOptions::LINEAR));
             }
         }
 
@@ -419,6 +559,27 @@ impl eframe::App for GallaApp {
             }
         }
 
+        // Delete-confirmation modal: swallow its keys so the view underneath
+        // doesn't also react to Enter/Esc/q.
+        if self.confirm_delete.is_some() {
+            let confirm = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Y)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            });
+            let cancel = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::N)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
+            });
+            if confirm {
+                if let Some(targets) = self.confirm_delete.take() {
+                    self.perform_delete(targets);
+                }
+            } else if cancel {
+                self.confirm_delete = None;
+            }
+        }
+
         match self.mode {
             Mode::Grid => self.grid_ui(ctx),
             Mode::Single { .. } => self.single_ui(ctx),
@@ -426,6 +587,9 @@ impl eframe::App for GallaApp {
 
         if self.show_help {
             self.draw_help(ctx);
+        }
+        if self.confirm_delete.is_some() {
+            self.draw_confirm(ctx);
         }
         self.draw_toast(ctx);
     }
@@ -517,18 +681,30 @@ impl GallaApp {
         let mut want_copy_path = false;
         let mut want_copy_img = false;
         let mut want_drag = false;
+        let mut want_delete = false;
+        let mut want_mark = false;
         ctx.input(|i| {
             want_open = i.key_pressed(egui::Key::Enter);
             want_quit = i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q);
             let y = i.key_pressed(egui::Key::Y);
             want_copy_path = y && !i.modifiers.shift;
             want_copy_img = y && i.modifiers.shift;
-            want_drag = i.key_pressed(egui::Key::D);
+            let d = i.key_pressed(egui::Key::D);
+            want_drag = d && !i.modifiers.shift;
+            want_delete = d && i.modifiers.shift;
+            want_mark = i.key_pressed(egui::Key::Space);
         });
 
         if want_quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
+            // Esc/q clears a selection first, only quitting when there is none.
+            if self.marked.is_empty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            self.marked.clear();
+        }
+        if want_mark && n > 0 && !self.marked.remove(&self.selected) {
+            self.marked.insert(self.selected);
         }
         if n > 0 {
             let path = self.entries[self.selected].path.clone();
@@ -542,15 +718,23 @@ impl GallaApp {
                 self.notify("Copied image");
             }
             if want_drag {
-                spawn_drag(&self.drag, &path);
-                self.notify("Drag started");
+                let targets = self.targets();
+                let paths: Vec<PathBuf> =
+                    targets.iter().map(|&i| self.entries[i].path.clone()).collect();
+                spawn_with(&self.drag, &paths);
+                self.notify(format!("Dragging {} file(s)", paths.len()));
+            }
+            if want_delete {
+                self.confirm_delete = Some(self.targets());
             }
         }
 
         let selected = self.selected;
         let scroll_to = self.scroll_to_selected;
         let entries = &self.entries;
+        let marked = &self.marked;
         let mut clicked: Option<usize> = None;
+        let mut click_shift = false;
         let mut new_cols = 1usize;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -594,6 +778,7 @@ impl GallaApp {
                                 };
                                 if resp.clicked() {
                                     clicked = Some(i);
+                                    click_shift = ui.input(|inp| inp.modifiers.shift);
                                 }
                                 if e.kind == Kind::Video {
                                     ui.painter().text(
@@ -602,6 +787,20 @@ impl GallaApp {
                                         "▶",
                                         FontId::proportional(22.0),
                                         Color32::WHITE,
+                                    );
+                                }
+                                if marked.contains(&i) {
+                                    ui.painter().rect_filled(
+                                        resp.rect,
+                                        4.0,
+                                        Color32::from_rgba_unmultiplied(120, 200, 120, 60),
+                                    );
+                                    ui.painter().text(
+                                        resp.rect.left_top() + Vec2::new(6.0, 4.0),
+                                        Align2::LEFT_TOP,
+                                        "✓",
+                                        FontId::proportional(20.0),
+                                        Color32::from_rgb(150, 230, 150),
                                     );
                                 }
                                 if i == selected {
@@ -624,10 +823,41 @@ impl GallaApp {
         self.cols = new_cols;
         self.scroll_to_selected = false;
         if let Some(i) = clicked {
-            self.selected = i;
-            self.open(ctx, i);
+            if click_shift {
+                // Shift-click marks the range from the cursor to the clicked tile.
+                let (a, b) = (self.selected.min(i), self.selected.max(i));
+                for k in a..=b {
+                    self.marked.insert(k);
+                }
+                self.selected = i;
+            } else {
+                self.selected = i;
+                self.open(ctx, i);
+            }
         } else if want_open && n > 0 {
+            self.open_targets(ctx);
+        }
+    }
+
+    /// Enter with a selection: play the marked videos in one player, otherwise
+    /// open the first marked image in the viewer. With no selection, act on the
+    /// cursor as before.
+    fn open_targets(&mut self, ctx: &egui::Context) {
+        if self.marked.is_empty() {
             self.open(ctx, self.selected);
+            return;
+        }
+        let targets = self.targets();
+        let videos: Vec<PathBuf> = targets
+            .iter()
+            .filter(|&&i| self.entries[i].kind == Kind::Video)
+            .map(|&i| self.entries[i].path.clone())
+            .collect();
+        if !videos.is_empty() {
+            spawn_with(&self.player, &videos);
+            self.notify(format!("Playing {} video(s)", videos.len()));
+        } else if let Some(&first) = targets.first() {
+            self.open(ctx, first);
         }
     }
 
@@ -644,6 +874,7 @@ impl GallaApp {
         let mut copy_path_key = false;
         let mut copy_img_key = false;
         let mut drag_key = false;
+        let mut delete_key = false;
         let mut reset = false;
         let mut step = 0isize;
         let mut zoom_key = 0.0f32;
@@ -652,7 +883,9 @@ impl GallaApp {
             let y = i.key_pressed(egui::Key::Y);
             copy_path_key = y && !i.modifiers.shift;
             copy_img_key = y && i.modifiers.shift;
-            drag_key = i.key_pressed(egui::Key::D);
+            let d = i.key_pressed(egui::Key::D);
+            drag_key = d && !i.modifiers.shift;
+            delete_key = d && i.modifiers.shift;
             reset = i.key_pressed(egui::Key::Num0);
             if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::L) {
                 step += 1;
@@ -685,6 +918,9 @@ impl GallaApp {
         if drag_key {
             spawn_drag(&self.drag, &self.entries[cur_idx].path);
             self.notify("Drag started");
+        }
+        if delete_key {
+            self.confirm_delete = Some(vec![cur_idx]);
         }
         if step != 0 {
             self.step_image(cur_idx, step);
@@ -789,7 +1025,8 @@ fn main() -> eframe::Result<()> {
                      Usage: galla [--player CMD] [--drag CMD] [PATH ...]\n\n\
                      PATH may be image/video files or directories (scanned one level).\n\
                      Defaults to the current directory.\n\n\
-                     Keys: arrows/hjkl move · Enter open · y copy path · Y copy image · d drag-out · ? help · q/Esc back/quit\n\
+                     Keys: arrows/hjkl move · Space/Shift+click select · Enter open/play · y copy path · Y copy image\n\
+                     d drag-out · D trash (confirm) · ? help · q/Esc clear-sel/back/quit\n\
                      Single view: scroll/+/- zoom · mouse-drag pan · 0 reset · ←/→ or h/l prev/next\n\n\
                      Player resolves: --player > $GALLA_PLAYER > ~/.config/galla/config.toml (player) > mpv\n\
                      Drag resolves:   --drag   > $GALLA_DRAG   > ~/.config/galla/config.toml (drag)   > dragon-drop --and-exit"

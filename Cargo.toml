@@ -10,6 +10,7 @@ repository = "https://github.com/antlis/galla"
 eframe = "0.29"
 image = "0.25"
 arboard = "3"
+trash = "5"
 
 [profile.release]
 opt-level = 3

@@ -19,10 +19,13 @@ or as an `xdg` image handler.
 - **Video thumbnails** via `ffmpegthumbnailer`, cached and invalidated on change.
 - **Built-in viewer** with scroll/`+`/`-` zoom, drag-to-pan, and reset.
 - **Vim-style navigation** (`hjkl`) alongside the arrow keys.
-- **Videos play in your player** of choice (`mpv` by default, configurable).
+- **Multi-select** with `Space` / `Shift`+click to act on many files at once.
+- **Videos play in your player** of choice (`mpv` by default, configurable);
+  several marked videos open as one playlist.
 - **Copy** the file path *or* the image itself to the clipboard.
-- **Drag-and-drop** a file into any other app (Telegram, browsers, file
-  managers) via [`dragon-drop`](https://github.com/mwh/dragon).
+- **Drag-and-drop** one or many files into any other app (Telegram, browsers,
+  file managers) via [`dragon-drop`](https://github.com/mwh/dragon).
+- **Move to trash** with `D` behind a confirmation prompt (recoverable).
 - **In-app help overlay** (`?`) and toast feedback for clipboard/drag actions.
 
 ## Install
@@ -52,16 +55,24 @@ galla [--player CMD] [--drag CMD] [PATH ...]
 
 | Key             | Action                                    |
 | --------------- | ----------------------------------------- |
-| arrows / `hjkl` | move selection (grid) / prev-next (image) |
-| `Enter`         | open (image → viewer, video → player)     |
-| `y`             | copy selected file's path to clipboard    |
-| `Y`             | copy the image itself to the clipboard    |
-| `d`             | drag-and-drop the file into another app   |
-| `?`             | toggle the keybinding help overlay        |
-| `q` / `Esc`     | back to grid / quit                       |
-| scroll, `+`/`-` | zoom (single image)                       |
-| mouse drag      | pan (single image)                        |
-| `0`             | reset zoom                                |
+| arrows / `hjkl` | move selection (grid) / prev-next (image)       |
+| `Space`         | mark / unmark the current tile                  |
+| `Shift`+click   | mark a range of tiles                           |
+| `Enter`         | open image → viewer; play video(s) → player     |
+| `y`             | copy selected file's path to clipboard          |
+| `Y`             | copy the image itself to the clipboard          |
+| `d`             | drag-and-drop the file(s) into another app      |
+| `D`             | move file(s) to trash — asks for confirmation   |
+| `?`             | toggle the keybinding help overlay              |
+| `q` / `Esc`     | clear selection, else back to grid / quit       |
+| scroll, `+`/`-` | zoom (single image)                             |
+| mouse drag      | pan (single image)                              |
+| `0`             | reset zoom                                      |
+
+**Selecting multiple files.** Mark tiles with `Space` (or `Shift`+click a range),
+then `d` drags them all into another app, `Enter` plays the marked videos in one
+player, and `D` moves them to the trash (after confirmation). Marked tiles get a
+green tint and a ✓; `Esc` clears the selection.
 
 Video thumbnails are generated with `ffmpegthumbnailer` and cached under
 `$XDG_CACHE_HOME/galla` (falls back to `~/.cache/galla`).
