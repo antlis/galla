@@ -1,0 +1,3 @@
+# Copy to ~/.config/galla/config.toml
+# External command used to play videos; the video path is appended.
+player = "mpv"

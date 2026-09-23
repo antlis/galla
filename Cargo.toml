@@ -1,0 +1,16 @@
+[package]
+name = "galla"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal image/video thumbnail gallery with zoom and a configurable external video player"
+license = "MIT"
+repository = "https://github.com/antlis/galla"
+
+[dependencies]
+eframe = "0.29"
+image = "0.25"
+arboard = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
