@@ -300,6 +300,7 @@ struct GallaApp {
     marked: HashSet<usize>,
     cols: usize,
     scroll_to_selected: bool,
+    started_single: bool,
     show_help: bool,
     confirm_delete: Option<Vec<usize>>,
     toast: Option<(String, Instant)>,
@@ -362,6 +363,7 @@ impl GallaApp {
             marked: HashSet::new(),
             cols: 1,
             scroll_to_selected: false,
+            started_single: matches!(mode, Mode::Single { .. }),
             show_help: false,
             confirm_delete: None,
             toast: None,
@@ -902,9 +904,16 @@ impl GallaApp {
         });
 
         if back {
-            self.mode = Mode::Grid;
-            self.selected = cur_idx;
-            self.scroll_to_selected = true;
+            // If galla was launched as a single-image viewer there is no grid to
+            // return to, so closing the image quits instead of showing a 1-tile
+            // grid. Drilling in from the grid still returns to the grid.
+            if self.started_single {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.mode = Mode::Grid;
+                self.selected = cur_idx;
+                self.scroll_to_selected = true;
+            }
             return;
         }
         if copy_path_key {
@@ -1029,7 +1038,7 @@ fn main() -> eframe::Result<()> {
                      d drag-out · D trash (confirm) · ? help · q/Esc clear-sel/back/quit\n\
                      Single view: scroll/+/- zoom · mouse-drag pan · 0 reset · ←/→ or h/l prev/next\n\n\
                      Player resolves: --player > $GALLA_PLAYER > ~/.config/galla/config.toml (player) > mpv\n\
-                     Drag resolves:   --drag   > $GALLA_DRAG   > ~/.config/galla/config.toml (drag)   > dragon-drop --and-exit"
+                     Drag resolves:   --drag   > $GALLA_DRAG   > ~/.config/galla/config.toml (drag)   > dragon-drop --and-exit --all"
                 );
                 return Ok(());
             }
@@ -1042,7 +1051,7 @@ fn main() -> eframe::Result<()> {
 
     let entries = collect(&paths);
     let player = resolve_command(cli_player, "player", "mpv");
-    let drag = resolve_command(cli_drag, "drag", "dragon-drop --and-exit");
+    let drag = resolve_command(cli_drag, "drag", "dragon-drop --and-exit --all");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

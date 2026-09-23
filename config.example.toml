@@ -2,6 +2,7 @@
 # External command used to play videos; the video path is appended.
 player = "mpv"
 
-# External drag-and-drop source spawned by the `d` key; the file path is
-# appended. dragon-drop shows a small window you can drag into other apps.
-drag = "dragon-drop --and-exit"
+# External drag-and-drop source spawned by the `d` key; the file paths are
+# appended. dragon-drop shows a small window you can drag into other apps;
+# --all makes a multi-file drag move every file in a single drag.
+drag = "dragon-drop --and-exit --all"

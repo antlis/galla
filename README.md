@@ -96,8 +96,8 @@ most-specific first, exactly like the player:
 
 1. `--drag "CMD"` on the command line
 2. `$GALLA_DRAG`
-3. `~/.config/galla/config.toml` — `drag = "dragon-drop --and-exit"`
-4. default: `dragon-drop --and-exit`
+3. `~/.config/galla/config.toml` — `drag = "dragon-drop --and-exit --all"`
+4. default: `dragon-drop --and-exit --all`
 
 The file path is appended as the final argument.
 [`dragon-drop`](https://github.com/mwh/dragon) provides the `dragon-drop` binary.
