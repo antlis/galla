@@ -5,17 +5,18 @@
 //! viewer with zoom/pan; videos are handed to a configurable external player
 //! (mpv by default). `y` copies the selected file's path to the clipboard.
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use eframe::egui;
 use egui::{
-    load::SizedTexture, Align, Align2, Color32, ColorImage, FontId, Rect, Stroke, TextureHandle,
-    TextureOptions, Vec2,
+    load::SizedTexture, Align, Align2, Color32, ColorImage, FontId, Rect, RichText, Stroke,
+    TextureHandle, TextureOptions, Vec2,
 };
 
 const THUMB: usize = 192;
@@ -155,26 +156,46 @@ fn make_thumb(path: &Path, kind: Kind, cache: &Path) -> Option<ColorImage> {
         }
     };
     let img = image::open(&source).ok()?;
-    Some(to_color_image(&img.thumbnail(THUMB as u32, THUMB as u32)))
+    let thumb = img.thumbnail(THUMB as u32, THUMB as u32).to_rgba8();
+    Some(square_thumb(&thumb, kind))
 }
 
-/// Resolve the external player command, most-specific source first:
-/// `--player` CLI flag > `$GALLA_PLAYER` > config file > "mpv".
-fn resolve_player(cli: Option<String>) -> Vec<String> {
+/// Letterbox an aspect-preserved thumbnail onto a square THUMB×THUMB canvas so
+/// grid cells stay uniform and images are never stretched.
+fn square_thumb(thumb: &image::RgbaImage, kind: Kind) -> ColorImage {
+    let shade = match kind {
+        Kind::Image => 45,
+        Kind::Video => 30,
+    };
+    let mut canvas = image::RgbaImage::from_pixel(
+        THUMB as u32,
+        THUMB as u32,
+        image::Rgba([shade, shade, shade, 255]),
+    );
+    let (tw, th) = thumb.dimensions();
+    let ox = ((THUMB as u32).saturating_sub(tw) / 2) as i64;
+    let oy = ((THUMB as u32).saturating_sub(th) / 2) as i64;
+    image::imageops::overlay(&mut canvas, thumb, ox, oy);
+    ColorImage::from_rgba_unmultiplied([THUMB, THUMB], canvas.as_raw())
+}
+
+/// Resolve an external command, most-specific source first:
+/// `--<name>` CLI flag > `$GALLA_<NAME>` > config file `<name> = ...` > default.
+fn resolve_command(cli: Option<String>, name: &str, default: &str) -> Vec<String> {
     let raw = cli
-        .or_else(|| std::env::var("GALLA_PLAYER").ok())
-        .or_else(config_player)
-        .unwrap_or_else(|| "mpv".to_string());
+        .or_else(|| std::env::var(format!("GALLA_{}", name.to_uppercase())).ok())
+        .or_else(|| config_value(name))
+        .unwrap_or_else(|| default.to_string());
     let parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
     if parts.is_empty() {
-        vec!["mpv".to_string()]
+        default.split_whitespace().map(|s| s.to_string()).collect()
     } else {
         parts
     }
 }
 
-/// Read `player = ...` from ~/.config/galla/config.toml (value may be quoted).
-fn config_player() -> Option<String> {
+/// Read `<key> = ...` from ~/.config/galla/config.toml (value may be quoted).
+fn config_value(key: &str) -> Option<String> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -186,7 +207,7 @@ fn config_player() -> Option<String> {
     let text = std::fs::read_to_string(cfg).ok()?;
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("player") {
+        if let Some(rest) = line.strip_prefix(key) {
             let rest = rest.trim_start();
             if let Some(val) = rest.strip_prefix('=') {
                 let val = val.trim().trim_matches(|c| c == '"' || c == '\'');
@@ -205,11 +226,48 @@ fn spawn_player(player: &[String], path: &Path) {
     }
 }
 
+/// Hand the file to an external drag-and-drop source (default `dragon-drop`) so
+/// it can be dragged into other apps (Telegram, browsers, file managers…).
+fn spawn_drag(drag: &[String], path: &Path) {
+    if let Some((cmd, args)) = drag.split_first() {
+        let _ = Command::new(cmd).args(args).arg(path).spawn();
+    }
+}
+
 fn copy_path(path: &Path) {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(path.to_string_lossy().to_string());
     }
 }
+
+/// Copy the decoded image itself to the clipboard as raw RGBA pixels.
+fn copy_image(path: &Path) {
+    let Ok(img) = image::open(path) else { return };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_image(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: Cow::Owned(rgba.into_raw()),
+        });
+    }
+}
+
+/// Keybindings shown in the `?` overlay.
+const HELP_KEYS: &[(&str, &str)] = &[
+    ("←/→   h / l", "move selection · prev/next image"),
+    ("↑/↓   k / j", "move selection (grid)"),
+    ("Enter", "open image in viewer · play video"),
+    ("y", "copy file path to clipboard"),
+    ("Y", "copy image to clipboard"),
+    ("d", "drag-and-drop file into another app"),
+    ("+ / - / scroll", "zoom (single view)"),
+    ("mouse drag", "pan (single view)"),
+    ("0", "reset zoom (single view)"),
+    ("?", "toggle this help"),
+    ("q / Esc", "back · quit"),
+];
 
 enum Mode {
     Grid,
@@ -225,15 +283,23 @@ struct GallaApp {
     entries: Vec<Entry>,
     image_indices: Vec<usize>,
     player: Vec<String>,
+    drag: Vec<String>,
     selected: usize,
     cols: usize,
     scroll_to_selected: bool,
+    show_help: bool,
+    toast: Option<(String, Instant)>,
     mode: Mode,
     rx: Receiver<(usize, ColorImage)>,
 }
 
 impl GallaApp {
-    fn new(cc: &eframe::CreationContext<'_>, entries: Vec<Entry>, player: Vec<String>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        entries: Vec<Entry>,
+        player: Vec<String>,
+        drag: Vec<String>,
+    ) -> Self {
         let image_indices = entries
             .iter()
             .enumerate()
@@ -276,12 +342,20 @@ impl GallaApp {
             entries,
             image_indices,
             player,
+            drag,
             selected: 0,
             cols: 1,
             scroll_to_selected: false,
+            show_help: false,
+            toast: None,
             mode,
             rx,
         }
+    }
+
+    /// Show a transient status message (auto-hides after a couple seconds).
+    fn notify(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
     }
 
     fn open(&mut self, ctx: &egui::Context, i: usize) {
@@ -330,30 +404,101 @@ impl eframe::App for GallaApp {
             }
         }
 
+        // `?` toggles the help overlay. While it is open, Esc/q close it and are
+        // consumed so the underlying view does not also act on them.
+        if ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+            self.show_help = !self.show_help;
+        }
+        if self.show_help {
+            let closed = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
+            });
+            if closed {
+                self.show_help = false;
+            }
+        }
+
         match self.mode {
             Mode::Grid => self.grid_ui(ctx),
             Mode::Single { .. } => self.single_ui(ctx),
         }
+
+        if self.show_help {
+            self.draw_help(ctx);
+        }
+        self.draw_toast(ctx);
     }
 }
 
 impl GallaApp {
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        const SHOW: f32 = 2.0;
+        let Some((msg, at)) = &self.toast else { return };
+        let elapsed = at.elapsed().as_secs_f32();
+        if elapsed > SHOW {
+            self.toast = None;
+            return;
+        }
+        let msg = msg.clone();
+        egui::Area::new(egui::Id::new("galla_toast"))
+            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_gray(25))
+                    .stroke(Stroke::new(1.0, Color32::from_gray(70)))
+                    .inner_margin(egui::vec2(14.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(msg).monospace().color(Color32::from_gray(230)));
+                    });
+            });
+        ctx.request_repaint(); // keep animating until it expires
+    }
+
+    fn draw_help(&self, ctx: &egui::Context) {
+        let accent = Color32::from_rgb(137, 180, 250);
+        egui::Area::new(egui::Id::new("galla_help"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_gray(20))
+                    .stroke(Stroke::new(1.0, Color32::from_gray(80)))
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("galla — keys").heading().color(accent));
+                        ui.add_space(8.0);
+                        egui::Grid::new("galla_help_grid")
+                            .spacing([20.0, 6.0])
+                            .show(ui, |ui| {
+                                for (k, d) in HELP_KEYS {
+                                    ui.label(RichText::new(*k).monospace().color(accent));
+                                    ui.label(RichText::new(*d).monospace());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+    }
+
     fn grid_ui(&mut self, ctx: &egui::Context) {
         let n = self.entries.len();
 
         // Keyboard navigation (uses last frame's column count).
         let (mut sel, cols) = (self.selected, self.cols.max(1));
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::ArrowRight) {
+            if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::L) {
                 sel += 1;
             }
-            if i.key_pressed(egui::Key::ArrowLeft) {
+            if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::H) {
                 sel = sel.saturating_sub(1);
             }
-            if i.key_pressed(egui::Key::ArrowDown) {
+            if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J) {
                 sel += cols;
             }
-            if i.key_pressed(egui::Key::ArrowUp) && sel >= cols {
+            if (i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K)) && sel >= cols {
                 sel -= cols;
             }
         });
@@ -369,19 +514,37 @@ impl GallaApp {
 
         let mut want_open = false;
         let mut want_quit = false;
-        let mut want_copy = false;
+        let mut want_copy_path = false;
+        let mut want_copy_img = false;
+        let mut want_drag = false;
         ctx.input(|i| {
             want_open = i.key_pressed(egui::Key::Enter);
             want_quit = i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q);
-            want_copy = i.key_pressed(egui::Key::Y);
+            let y = i.key_pressed(egui::Key::Y);
+            want_copy_path = y && !i.modifiers.shift;
+            want_copy_img = y && i.modifiers.shift;
+            want_drag = i.key_pressed(egui::Key::D);
         });
 
         if want_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if want_copy && n > 0 {
-            copy_path(&self.entries[self.selected].path);
+        if n > 0 {
+            let path = self.entries[self.selected].path.clone();
+            let is_image = self.entries[self.selected].kind == Kind::Image;
+            if want_copy_path {
+                copy_path(&path);
+                self.notify("Copied path");
+            }
+            if want_copy_img && is_image {
+                copy_image(&path);
+                self.notify("Copied image");
+            }
+            if want_drag {
+                spawn_drag(&self.drag, &path);
+                self.notify("Drag started");
+            }
         }
 
         let selected = self.selected;
@@ -405,9 +568,15 @@ impl GallaApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let size = Vec2::splat(THUMB as f32);
+                    // Centre the grid so leftover width is split evenly, not all
+                    // dumped on the right edge.
+                    let row_w = new_cols as f32 * THUMB as f32
+                        + new_cols.saturating_sub(1) as f32 * spacing;
+                    let pad = ((ui.available_width() - row_w) / 2.0).max(0.0);
                     let mut i = 0;
                     while i < entries.len() {
                         ui.horizontal(|ui| {
+                            ui.add_space(pad);
                             for _ in 0..new_cols {
                                 if i >= entries.len() {
                                     break;
@@ -472,18 +641,23 @@ impl GallaApp {
 
         // Handle navigation / actions first (may replace self.mode).
         let mut back = false;
-        let mut copy = false;
+        let mut copy_path_key = false;
+        let mut copy_img_key = false;
+        let mut drag_key = false;
         let mut reset = false;
         let mut step = 0isize;
         let mut zoom_key = 0.0f32;
         ctx.input(|i| {
             back = i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q);
-            copy = i.key_pressed(egui::Key::Y);
+            let y = i.key_pressed(egui::Key::Y);
+            copy_path_key = y && !i.modifiers.shift;
+            copy_img_key = y && i.modifiers.shift;
+            drag_key = i.key_pressed(egui::Key::D);
             reset = i.key_pressed(egui::Key::Num0);
-            if i.key_pressed(egui::Key::ArrowRight) {
+            if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::L) {
                 step += 1;
             }
-            if i.key_pressed(egui::Key::ArrowLeft) {
+            if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::H) {
                 step -= 1;
             }
             if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
@@ -500,8 +674,17 @@ impl GallaApp {
             self.scroll_to_selected = true;
             return;
         }
-        if copy {
+        if copy_path_key {
             copy_path(&self.entries[cur_idx].path);
+            self.notify("Copied path");
+        }
+        if copy_img_key {
+            copy_image(&self.entries[cur_idx].path);
+            self.notify("Copied image");
+        }
+        if drag_key {
+            spawn_drag(&self.drag, &self.entries[cur_idx].path);
+            self.notify("Drag started");
         }
         if step != 0 {
             self.step_image(cur_idx, step);
@@ -594,19 +777,22 @@ impl GallaApp {
 fn main() -> eframe::Result<()> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cli_player: Option<String> = None;
+    let mut cli_drag: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--player" | "-p" => cli_player = args.next(),
+            "--drag" | "-d" => cli_drag = args.next(),
             "--help" | "-h" => {
                 println!(
                     "galla — minimal image/video gallery\n\n\
-                     Usage: galla [--player CMD] [PATH ...]\n\n\
+                     Usage: galla [--player CMD] [--drag CMD] [PATH ...]\n\n\
                      PATH may be image/video files or directories (scanned one level).\n\
                      Defaults to the current directory.\n\n\
-                     Keys: arrows move · Enter open · y copy path · q/Esc back/quit\n\
-                     Single view: scroll/+/- zoom · drag pan · 0 reset · ←/→ prev/next\n\n\
-                     Player resolves: --player > $GALLA_PLAYER > ~/.config/galla/config.toml > mpv"
+                     Keys: arrows/hjkl move · Enter open · y copy path · Y copy image · d drag-out · ? help · q/Esc back/quit\n\
+                     Single view: scroll/+/- zoom · mouse-drag pan · 0 reset · ←/→ or h/l prev/next\n\n\
+                     Player resolves: --player > $GALLA_PLAYER > ~/.config/galla/config.toml (player) > mpv\n\
+                     Drag resolves:   --drag   > $GALLA_DRAG   > ~/.config/galla/config.toml (drag)   > dragon-drop --and-exit"
                 );
                 return Ok(());
             }
@@ -618,7 +804,8 @@ fn main() -> eframe::Result<()> {
     }
 
     let entries = collect(&paths);
-    let player = resolve_player(cli_player);
+    let player = resolve_command(cli_player, "player", "mpv");
+    let drag = resolve_command(cli_drag, "drag", "dragon-drop --and-exit");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -629,6 +816,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "galla",
         native_options,
-        Box::new(move |cc| Ok(Box::new(GallaApp::new(cc, entries, player)))),
+        Box::new(move |cc| Ok(Box::new(GallaApp::new(cc, entries, player, drag)))),
     )
 }

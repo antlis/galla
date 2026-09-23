@@ -1,3 +1,7 @@
 # Copy to ~/.config/galla/config.toml
 # External command used to play videos; the video path is appended.
 player = "mpv"
+
+# External drag-and-drop source spawned by the `d` key; the file path is
+# appended. dragon-drop shows a small window you can drag into other apps.
+drag = "dragon-drop --and-exit"
